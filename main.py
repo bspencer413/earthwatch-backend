@@ -31,8 +31,9 @@ ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 10080
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 FROM_EMAIL = os.environ.get("FROM_EMAIL", "alerts@earthwatch.app")
+GOOGLE_GEOCODING_API_KEY = os.environ.get("GOOGLE_GEOCODING_API_KEY", "")
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
@@ -517,7 +518,9 @@ async def delete_place(place_id: int, user_id: int = Depends(get_current_user)):
 
 @app.get("/ew/places/{place_id}/events")
 async def get_place_events(place_id: int, user_id: int = Depends(get_current_user)):
-    """Return matched hazard events for this place, newest first. Drawer payload."""
+    """Return matched hazard events for this place, newest first. Drawer payload.
+    Includes a static_map_url (Google Static Maps) sized to the place radius
+    or, if there are matched events, sized to fit them all. Key stays server-side."""
     with get_db() as conn:
         c = conn.cursor()
         c.execute("SELECT id, name, lat, lng, radius_mi FROM ew_places WHERE id = %s AND user_id = %s",
@@ -527,7 +530,8 @@ async def get_place_events(place_id: int, user_id: int = Depends(get_current_use
             raise HTTPException(status_code=404, detail="Place not found")
         c.execute("""
             SELECT e.id, e.source, e.external_id, e.hazard_type, e.severity, e.magnitude,
-                   e.title, e.description, e.url, e.occurred_at, m.distance_mi
+                   e.title, e.description, e.url, e.occurred_at, m.distance_mi,
+                   ST_Y(e.geom::geometry) AS ev_lat, ST_X(e.geom::geometry) AS ev_lng
             FROM ew_event_matches m
             JOIN ew_events e ON m.event_id = e.id
             WHERE m.place_id = %s
@@ -536,7 +540,10 @@ async def get_place_events(place_id: int, user_id: int = Depends(get_current_use
             LIMIT 50
         """, (place_id,))
         events = []
+        ev_pins = []  # for static map
         for row in c.fetchall():
+            ev_lat = float(row[11]) if row[11] is not None else None
+            ev_lng = float(row[12]) if row[12] is not None else None
             events.append({
                 "id": row[0],
                 "source": row[1],
@@ -549,18 +556,118 @@ async def get_place_events(place_id: int, user_id: int = Depends(get_current_use
                 "url": row[8],
                 "occurred_at": str(row[9]) if row[9] else None,
                 "distance_mi": round(float(row[10]), 1) if row[10] is not None else None,
+                "lat": ev_lat,
+                "lng": ev_lng,
             })
+            if ev_lat is not None and ev_lng is not None:
+                ev_pins.append((ev_lat, ev_lng, row[4]))  # severity for color
+
+        place_lat = float(place[2])
+        place_lng = float(place[3])
+        place_radius = float(place[4])
+
+        static_map_url = build_static_map_url(place_lat, place_lng, place_radius, ev_pins)
+
         return {
             "place": {
                 "id": place[0],
                 "name": place[1],
-                "lat": float(place[2]),
-                "lng": float(place[3]),
-                "radius_mi": float(place[4]),
+                "lat": place_lat,
+                "lng": place_lng,
+                "radius_mi": place_radius,
             },
             "events": events,
             "count": len(events),
+            "static_map_url": static_map_url,
         }
+
+
+def build_static_map_url(lat: float, lng: float, radius_mi: float, ev_pins: list) -> Optional[str]:
+    """Return a Google Static Maps URL showing the place + radius circle + event pins.
+    If GOOGLE_GEOCODING_API_KEY is unset, returns None (frontend just hides the map)."""
+    if not GOOGLE_GEOCODING_API_KEY:
+        return None
+    # Pick a zoom level: tight to radius if no events, else let Google auto-fit via markers.
+    # Static Maps doesn't draw circles natively — we approximate with an encoded path of
+    # 36 points around the place at the radius distance.
+    import math
+    pts = []
+    R_EARTH_MI = 3958.8
+    for i in range(0, 37):
+        angle = (i / 36.0) * 2 * math.pi
+        # Approximate: small-distance offset on a sphere
+        dlat = (radius_mi / R_EARTH_MI) * math.cos(angle) * (180.0 / math.pi)
+        dlng = (radius_mi / R_EARTH_MI) * math.sin(angle) * (180.0 / math.pi) / max(0.01, math.cos(math.radians(lat)))
+        pts.append((lat + dlat, lng + dlng))
+    path = "color:0x0d9488ff|weight:2|fillcolor:0x0d948833|" + "|".join([str(round(p[0], 5)) + "," + str(round(p[1], 5)) for p in pts])
+
+    markers = []
+    # Place center pin (teal)
+    markers.append("color:0x0d9488|label:H|" + str(lat) + "," + str(lng))
+    # Event pins, color by severity
+    sev_color = {"extreme": "0xdc2626", "severe": "0xea580c", "moderate": "0xd97706", "minor": "0xa16207"}
+    for (elat, elng, sev) in ev_pins[:20]:
+        c = sev_color.get(sev or "minor", "0xa16207")
+        markers.append("color:" + c + "|" + str(round(elat, 5)) + "," + str(round(elng, 5)))
+
+    params = [
+        "size=640x320",
+        "scale=2",
+        "maptype=terrain",
+        "path=" + urllib.parse.quote(path),
+    ]
+    for m in markers:
+        params.append("markers=" + urllib.parse.quote(m))
+    params.append("key=" + GOOGLE_GEOCODING_API_KEY)
+    return "https://maps.googleapis.com/maps/api/staticmap?" + "&".join(params)
+
+
+# ── Google Geocoding (search box on Add Place) ────────────────────────────────
+
+class GeocodeQuery(BaseModel):
+    query: str
+
+@app.post("/ew/geocode")
+async def geocode_place(q: GeocodeQuery, user_id: int = Depends(get_current_user)):
+    """Forward geocode a free-text query (city, address, landmark) via Google.
+    Returns up to 5 candidates so the user can pick the right match.
+    Backend-side so the API key never lives in the frontend."""
+    if not GOOGLE_GEOCODING_API_KEY:
+        raise HTTPException(status_code=503, detail="Geocoding service not configured")
+    text = (q.query or "").strip()
+    if len(text) < 2:
+        raise HTTPException(status_code=400, detail="Query too short")
+    try:
+        url = ("https://maps.googleapis.com/maps/api/geocode/json?address="
+               + urllib.parse.quote(text)
+               + "&key=" + GOOGLE_GEOCODING_API_KEY)
+        req = urllib.request.Request(url, headers={"User-Agent": "EarthWatch/0.1"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json_lib.loads(resp.read().decode("utf-8", errors="replace"))
+    except Exception as e:
+        print("[geocode] " + str(e))
+        raise HTTPException(status_code=502, detail="Geocoding lookup failed")
+    status = data.get("status")
+    if status == "ZERO_RESULTS":
+        return {"candidates": []}
+    if status != "OK":
+        # Don't leak Google error_message to client — just say it failed.
+        print("[geocode] Google returned status=" + str(status) + " for query: " + text)
+        raise HTTPException(status_code=502, detail="Geocoding lookup failed")
+    candidates = []
+    for r in (data.get("results") or [])[:5]:
+        loc = ((r.get("geometry") or {}).get("location")) or {}
+        lat = loc.get("lat")
+        lng = loc.get("lng")
+        if lat is None or lng is None:
+            continue
+        candidates.append({
+            "formatted_address": r.get("formatted_address", ""),
+            "lat": float(lat),
+            "lng": float(lng),
+            "place_id": r.get("place_id", ""),
+        })
+    return {"candidates": candidates}
 
 
 # ── Notifications (alerts feed) ───────────────────────────────────────────────
@@ -850,10 +957,11 @@ def run_check_cycle():
 
 
 def run_scheduler():
-    # v0.1.0: hourly for all users. Per-user check_interval enforcement is v0.2.
+    # v0.1.1: 12-hour cycle for free tier. Per-user check_interval enforcement
+    # (premium = faster cycle) is v0.2.
     # Uses plain time.time() — no scheduler library needed (sidesteps Render
     # cached-venv issues with packages like `schedule` / `apscheduler`).
-    INTERVAL_SEC = 60 * 60  # 1 hour
+    INTERVAL_SEC = 60 * 60 * 12  # 12 hours
     last_run = 0.0
     while True:
         now = time.time()
@@ -863,7 +971,7 @@ def run_scheduler():
             except Exception as e:
                 print("[scheduler] check cycle failed: " + str(e))
             last_run = now
-        time.sleep(30)
+        time.sleep(60)
 
 
 @app.on_event("startup")
@@ -872,7 +980,7 @@ async def startup_event():
     print("Database initialized (EarthWatch v" + VERSION + ")")
     scheduler_thread = threading.Thread(target=run_scheduler, daemon=True)
     scheduler_thread.start()
-    print("Background scheduler started (hourly check cycle: usgs + nws + eonet + gdacs)")
+    print("Background scheduler started (12-hour check cycle: usgs + nws + eonet + gdacs)")
     threading.Thread(target=run_check_cycle, daemon=True).start()
     print("Initial EW check cycle started")
 
