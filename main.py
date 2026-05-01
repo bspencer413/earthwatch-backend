@@ -33,7 +33,7 @@ RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 FROM_EMAIL = os.environ.get("FROM_EMAIL", "alerts@earthwatch.app")
 GOOGLE_GEOCODING_API_KEY = os.environ.get("GOOGLE_GEOCODING_API_KEY", "")
 
-VERSION = "0.1.4"
+VERSION = "0.1.5"
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
