@@ -9,7 +9,6 @@ import bcrypt
 import psycopg2
 import psycopg2.extras
 import os
-import schedule
 import threading
 import time
 import re
@@ -852,9 +851,18 @@ def run_check_cycle():
 
 def run_scheduler():
     # v0.1.0: hourly for all users. Per-user check_interval enforcement is v0.2.
-    schedule.every(60).minutes.do(run_check_cycle)
+    # Uses plain time.time() — no scheduler library needed (sidesteps Render
+    # cached-venv issues with packages like `schedule` / `apscheduler`).
+    INTERVAL_SEC = 60 * 60  # 1 hour
+    last_run = 0.0
     while True:
-        schedule.run_pending()
+        now = time.time()
+        if now - last_run >= INTERVAL_SEC:
+            try:
+                run_check_cycle()
+            except Exception as e:
+                print("[scheduler] check cycle failed: " + str(e))
+            last_run = now
         time.sleep(30)
 
 
