@@ -33,7 +33,7 @@ RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 FROM_EMAIL = os.environ.get("FROM_EMAIL", "alerts@earthwatch.app")
 GOOGLE_GEOCODING_API_KEY = os.environ.get("GOOGLE_GEOCODING_API_KEY", "")
 
-VERSION = "0.1.2"
+VERSION = "0.1.3"
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
@@ -810,14 +810,100 @@ class Sources:
         return out
 
     # ── NWS Severe Weather (CAP alerts) ───────────────────────────────────────
-    # Stub for v0.1.0 — adapter wired in next patch. Returns [] so the cron
-    # spatial-join still completes cleanly when this source is empty.
+    # Public GeoJSON feed at api.weather.gov/alerts/active. No auth, no key,
+    # but they require a User-Agent identifying the app. CAP polygons get
+    # converted to representative-point geometry (centroid via lat/lng if no
+    # geometry block) so the spatial-join still works. Note: ~10% of CAP alerts
+    # ship with no geometry at all (zone-based only) — we skip those for now.
     @staticmethod
     def fetch_nws() -> List[dict]:
-        # TODO v0.1.1: pull https://api.weather.gov/alerts/active (GeoJSON),
-        # store full polygon geometry, map severity/urgency/certainty to our
-        # severity bucket, dedupe by event_id field.
-        return []
+        url = "https://api.weather.gov/alerts/active"
+        data = Sources._http_get_json(url)
+        if not data or "features" not in data:
+            return []
+        out = []
+        for feat in data.get("features", []):
+            props = feat.get("properties") or {}
+            geom = feat.get("geometry")
+            if not geom:
+                continue  # zone-only alert, no point/polygon — skip for v0.1.3
+            geom_type = geom.get("type")
+            coords = geom.get("coordinates") or []
+            geom_wkt = None
+            try:
+                if geom_type == "Polygon" and coords and coords[0]:
+                    ring = coords[0]
+                    pts = ",".join([str(p[0]) + " " + str(p[1]) for p in ring])
+                    geom_wkt = "POLYGON((" + pts + "))"
+                elif geom_type == "MultiPolygon" and coords:
+                    polys = []
+                    for poly in coords:
+                        if not poly or not poly[0]:
+                            continue
+                        ring = poly[0]
+                        pts = ",".join([str(p[0]) + " " + str(p[1]) for p in ring])
+                        polys.append("((" + pts + "))")
+                    if polys:
+                        geom_wkt = "MULTIPOLYGON(" + ",".join(polys) + ")"
+                elif geom_type == "Point" and len(coords) >= 2:
+                    geom_wkt = "POINT(" + str(coords[0]) + " " + str(coords[1]) + ")"
+            except Exception:
+                continue
+            if not geom_wkt:
+                continue
+
+            ext_id = props.get("id") or feat.get("id")
+            if not ext_id:
+                continue
+
+            # Map NWS severity (Extreme|Severe|Moderate|Minor|Unknown) to ours.
+            nws_sev = (props.get("severity") or "").lower()
+            sev_map = {"extreme": "extreme", "severe": "severe", "moderate": "moderate", "minor": "minor"}
+            severity = sev_map.get(nws_sev, "minor")
+
+            event_name = props.get("event") or "Weather Alert"  # e.g. "Tornado Warning"
+            headline = props.get("headline") or event_name
+            desc = (props.get("description") or "")[:600]
+            sent = props.get("sent")
+            occurred_at = None
+            if sent:
+                try:
+                    s = sent.replace("Z", "+00:00")
+                    occurred_at = datetime.fromisoformat(s).astimezone(timezone.utc).replace(tzinfo=None)
+                except Exception:
+                    occurred_at = None
+
+            # Map event name to broad hazard_type for the icon.
+            ev_lower = event_name.lower()
+            if "tornado" in ev_lower:
+                hazard_type = "tornado"
+            elif "hurricane" in ev_lower or "tropical" in ev_lower:
+                hazard_type = "hurricane"
+            elif "tsunami" in ev_lower:
+                hazard_type = "tsunami"
+            elif "fire" in ev_lower or "smoke" in ev_lower:
+                hazard_type = "wildfire"
+            elif "flood" in ev_lower:
+                hazard_type = "flood"
+            elif "winter" in ev_lower or "snow" in ev_lower or "ice" in ev_lower or "blizzard" in ev_lower:
+                hazard_type = "winter_storm"
+            else:
+                hazard_type = "severe_weather"
+
+            out.append({
+                "source": "nws",
+                "external_id": str(ext_id),
+                "hazard_type": hazard_type,
+                "severity": severity,
+                "magnitude": None,
+                "title": event_name,
+                "description": headline,
+                "url": props.get("@id") or props.get("id"),
+                "occurred_at": occurred_at,
+                "geom_wkt": geom_wkt,
+                "raw": {"properties": props},  # skip the full feature to keep payload sane
+            })
+        return out
 
     # ── NASA EONET (fires, volcanoes, storms, ice) ────────────────────────────
     # Stub for v0.1.0.
