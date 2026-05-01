@@ -33,7 +33,7 @@ RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 FROM_EMAIL = os.environ.get("FROM_EMAIL", "alerts@earthwatch.app")
 GOOGLE_GEOCODING_API_KEY = os.environ.get("GOOGLE_GEOCODING_API_KEY", "")
 
-VERSION = "0.1.5"
+VERSION = "0.1.6"
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
@@ -101,8 +101,15 @@ def init_db():
     c.execute("CREATE INDEX IF NOT EXISTS idx_notifications_source ON notifications (source_type, source_ref_id)")
 
     # === EW schema ───────────────────────────────────────────────────────────
-    # Places: a user-watched geofence (name + point + radius). is_archived
-    # flips a place into "My Places" without deleting it.
+    # Places: a user-watched geofence (name + point + radius).
+    #
+    # Two booleans:
+    #   - is_archived: legacy v0.1.0–v0.1.5 flag for "moved to My Places."
+    #     v0.1.6 stops using this — kept on the row for backward-compat only.
+    #   - in_my_places: v0.1.6 model. A place ALWAYS stays in Watchlist (where the
+    #     cron monitors it). When a user taps "Save to My Places" the place is
+    #     ALSO added to the My Places collection without leaving Watchlist.
+    #     Watchlist and My Places are independent views of the same row.
     c.execute("""CREATE TABLE IF NOT EXISTS ew_places (
         id SERIAL PRIMARY KEY,
         user_id INTEGER NOT NULL,
@@ -116,6 +123,15 @@ def init_db():
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (user_id) REFERENCES users (id)
     )""")
+    # v0.1.6: add in_my_places column (idempotent).
+    c.execute("ALTER TABLE ew_places ADD COLUMN IF NOT EXISTS in_my_places BOOLEAN NOT NULL DEFAULT FALSE")
+    # One-shot migration: any existing place that was archived under the old
+    # model gets is_archived flipped back to FALSE and in_my_places set TRUE.
+    # That gives users a clean state — their archived items show up in My Places
+    # AND in Watchlist (the new canonical behavior).
+    c.execute("""UPDATE ew_places
+                 SET in_my_places = TRUE, is_archived = FALSE
+                 WHERE is_archived = TRUE AND in_my_places = FALSE""")
     # Generated PostGIS geometry column (auto-derived from lat/lng).
     c.execute("""DO $$
     BEGIN
@@ -262,7 +278,8 @@ class PlaceUpdate(BaseModel):
     name: Optional[str] = None
     radius_mi: Optional[float] = None
     alert_level: Optional[str] = None
-    is_archived: Optional[bool] = None
+    is_archived: Optional[bool] = None  # legacy — kept for backward compat
+    in_my_places: Optional[bool] = None  # v0.1.6 canonical
 
 class PlaceResponse(BaseModel):
     id: int
@@ -272,6 +289,7 @@ class PlaceResponse(BaseModel):
     radius_mi: float
     alert_level: str
     is_archived: bool
+    in_my_places: bool
     created_at: str
 
 # === MW LEGACY (commented for EW) =============================================
@@ -446,10 +464,11 @@ async def list_places(user_id: int = Depends(get_current_user)):
     with get_db() as conn:
         c = conn.cursor()
         c.execute("""
-            SELECT id, name, lat, lng, radius_mi, alert_level, is_archived, created_at
+            SELECT id, name, lat, lng, radius_mi, alert_level, is_archived,
+                   in_my_places, created_at
             FROM ew_places
             WHERE user_id = %s
-            ORDER BY is_archived ASC, created_at DESC
+            ORDER BY created_at DESC
         """, (user_id,))
         items = []
         for row in c.fetchall():
@@ -461,7 +480,8 @@ async def list_places(user_id: int = Depends(get_current_user)):
                 "radius_mi": float(row[4]),
                 "alert_level": row[5],
                 "is_archived": bool(row[6]),
-                "created_at": str(row[7]),
+                "in_my_places": bool(row[7]),
+                "created_at": str(row[8]),
             })
         return items
 
@@ -496,6 +516,7 @@ async def add_place(item: PlaceItem, user_id: int = Depends(get_current_user)):
             "radius_mi": radius,
             "alert_level": alert_level,
             "is_archived": False,
+            "in_my_places": False,
             "created_at": str(row[1]),
         }
 
@@ -525,6 +546,9 @@ async def update_place(place_id: int, update: PlaceUpdate, user_id: int = Depend
         if update.is_archived is not None:
             sets.append("is_archived = %s")
             params.append(bool(update.is_archived))
+        if update.in_my_places is not None:
+            sets.append("in_my_places = %s")
+            params.append(bool(update.in_my_places))
         if not sets:
             return {"message": "No changes"}
         params.append(place_id)
@@ -556,7 +580,7 @@ async def get_place_events(place_id: int, user_id: int = Depends(get_current_use
     /watchlist/{id}/refresh behavior, scaled to the EW spatial-join model."""
     with get_db() as conn:
         c = conn.cursor()
-        c.execute("SELECT id, name, lat, lng, radius_mi, is_archived FROM ew_places WHERE id = %s AND user_id = %s",
+        c.execute("SELECT id, name, lat, lng, radius_mi, is_archived, in_my_places FROM ew_places WHERE id = %s AND user_id = %s",
                   (place_id, user_id))
         place = c.fetchone()
         if not place:
@@ -614,6 +638,7 @@ async def get_place_events(place_id: int, user_id: int = Depends(get_current_use
                 "lng": place_lng,
                 "radius_mi": place_radius,
                 "is_archived": bool(place[5]),
+                "in_my_places": bool(place[6]),
             },
             "events": events,
             "count": len(events),
@@ -1032,7 +1057,6 @@ def spatial_join_and_alert(conn, new_event_ids: List[int]) -> int:
         FROM ew_events e
         JOIN ew_places p ON ST_DWithin(e.geom, p.geom, p.radius_mi * 1609.344)
         WHERE e.id = ANY(%s)
-          AND p.is_archived = FALSE
           AND p.alert_level <> 'off'
         ON CONFLICT (event_id, place_id) DO NOTHING
     """, (new_event_ids,))
