@@ -33,7 +33,7 @@ RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 FROM_EMAIL = os.environ.get("FROM_EMAIL", "alerts@earthwatch.app")
 GOOGLE_GEOCODING_API_KEY = os.environ.get("GOOGLE_GEOCODING_API_KEY", "")
 
-VERSION = "0.1.3"
+VERSION = "0.1.4"
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
@@ -547,29 +547,42 @@ async def delete_place(place_id: int, user_id: int = Depends(get_current_user)):
 
 @app.get("/ew/places/{place_id}/events")
 async def get_place_events(place_id: int, user_id: int = Depends(get_current_user)):
-    """Return matched hazard events for this place, newest first. Drawer payload.
-    Includes a static_map_url (Google Static Maps) sized to the place radius
-    or, if there are matched events, sized to fit them all. Key stays server-side."""
+    """Drawer payload — does a LIVE spatial join against the events table for this
+    place's geofence, regardless of whether the place is on Watchlist or My Places.
+
+    Canonical MW pattern: cron-driven background work writes to a tracking table
+    (ew_event_matches) for de-dup of alerts; the drawer-on-open endpoint queries
+    sources/events directly for the freshest answer at view-time. Mirrors MW's
+    /watchlist/{id}/refresh behavior, scaled to the EW spatial-join model."""
     with get_db() as conn:
         c = conn.cursor()
-        c.execute("SELECT id, name, lat, lng, radius_mi FROM ew_places WHERE id = %s AND user_id = %s",
+        c.execute("SELECT id, name, lat, lng, radius_mi, is_archived FROM ew_places WHERE id = %s AND user_id = %s",
                   (place_id, user_id))
         place = c.fetchone()
         if not place:
             raise HTTPException(status_code=404, detail="Place not found")
+
+        place_lat = float(place[2])
+        place_lng = float(place[3])
+        place_radius = float(place[4])
+
+        # Live spatial join: fetch matched events directly from ew_events for this
+        # place, regardless of is_archived state. No dependence on ew_event_matches.
         c.execute("""
             SELECT e.id, e.source, e.external_id, e.hazard_type, e.severity, e.magnitude,
-                   e.title, e.description, e.url, e.occurred_at, m.distance_mi,
+                   e.title, e.description, e.url, e.occurred_at,
+                   ST_Distance(e.geom, p.geom) / 1609.344 AS distance_mi,
                    ST_Y(e.geom::geometry) AS ev_lat, ST_X(e.geom::geometry) AS ev_lng
-            FROM ew_event_matches m
-            JOIN ew_events e ON m.event_id = e.id
-            WHERE m.place_id = %s
+            FROM ew_events e, ew_places p
+            WHERE p.id = %s
+              AND ST_DWithin(e.geom, p.geom, p.radius_mi * 1609.344)
               AND e.occurred_at > NOW() - INTERVAL '30 days'
             ORDER BY e.occurred_at DESC
             LIMIT 50
         """, (place_id,))
+
         events = []
-        ev_pins = []  # for static map
+        ev_pins = []
         for row in c.fetchall():
             ev_lat = float(row[11]) if row[11] is not None else None
             ev_lng = float(row[12]) if row[12] is not None else None
@@ -589,11 +602,7 @@ async def get_place_events(place_id: int, user_id: int = Depends(get_current_use
                 "lng": ev_lng,
             })
             if ev_lat is not None and ev_lng is not None:
-                ev_pins.append((ev_lat, ev_lng, row[4]))  # severity for color
-
-        place_lat = float(place[2])
-        place_lng = float(place[3])
-        place_radius = float(place[4])
+                ev_pins.append((ev_lat, ev_lng, row[4]))
 
         static_map_url = build_static_map_url(place_lat, place_lng, place_radius, ev_pins)
 
@@ -604,6 +613,7 @@ async def get_place_events(place_id: int, user_id: int = Depends(get_current_use
                 "lat": place_lat,
                 "lng": place_lng,
                 "radius_mi": place_radius,
+                "is_archived": bool(place[5]),
             },
             "events": events,
             "count": len(events),
