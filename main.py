@@ -368,6 +368,35 @@ async def admin_check_now():
     return {"message": "EW check cycle started"}
 
 
+@app.get("/admin/who-owns-what")
+async def admin_who_owns_what():
+    """Debug endpoint: show every user and how many places they own (active + archived).
+    Used to verify the user_id filter is doing its job and we're not leaking data
+    across accounts."""
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute("""
+            SELECT u.id, u.email,
+                   COUNT(p.id) FILTER (WHERE p.is_archived = FALSE) AS active,
+                   COUNT(p.id) FILTER (WHERE p.is_archived = TRUE) AS archived,
+                   COUNT(p.id) AS total
+            FROM users u
+            LEFT JOIN ew_places p ON p.user_id = u.id
+            GROUP BY u.id, u.email
+            ORDER BY u.id
+        """)
+        rows = []
+        for r in c.fetchall():
+            rows.append({
+                "user_id": r[0],
+                "email": r[1],
+                "active": int(r[2]),
+                "archived": int(r[3]),
+                "total": int(r[4]),
+            })
+        return {"users": rows, "version": VERSION}
+
+
 # ── Auth endpoints ────────────────────────────────────────────────────────────
 
 @app.post("/auth/register", response_model=Token)
