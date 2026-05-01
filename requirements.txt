@@ -4,5 +4,4 @@ pydantic[email]
 pyjwt
 bcrypt
 psycopg2-binary
-schedule
 httpx
