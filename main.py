@@ -33,7 +33,7 @@ RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 FROM_EMAIL = os.environ.get("FROM_EMAIL", "alerts@earthwatch.app")
 GOOGLE_GEOCODING_API_KEY = os.environ.get("GOOGLE_GEOCODING_API_KEY", "")
 
-VERSION = "0.1.1"
+VERSION = "0.1.2"
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
@@ -584,36 +584,49 @@ async def get_place_events(place_id: int, user_id: int = Depends(get_current_use
 
 def build_static_map_url(lat: float, lng: float, radius_mi: float, ev_pins: list) -> Optional[str]:
     """Return a Google Static Maps URL showing the place + radius circle + event pins.
-    If GOOGLE_GEOCODING_API_KEY is unset, returns None (frontend just hides the map)."""
+    If GOOGLE_GEOCODING_API_KEY is unset, returns None (frontend just hides the map).
+    Zoom is computed from the radius so the circle fills most of the frame; we don't
+    let Google auto-fit because event markers far outside the radius would zoom out
+    too aggressively and shrink the user's place to a dot."""
     if not GOOGLE_GEOCODING_API_KEY:
         return None
-    # Pick a zoom level: tight to radius if no events, else let Google auto-fit via markers.
-    # Static Maps doesn't draw circles natively — we approximate with an encoded path of
-    # 36 points around the place at the radius distance.
     import math
     pts = []
     R_EARTH_MI = 3958.8
     for i in range(0, 37):
         angle = (i / 36.0) * 2 * math.pi
-        # Approximate: small-distance offset on a sphere
         dlat = (radius_mi / R_EARTH_MI) * math.cos(angle) * (180.0 / math.pi)
         dlng = (radius_mi / R_EARTH_MI) * math.sin(angle) * (180.0 / math.pi) / max(0.01, math.cos(math.radians(lat)))
         pts.append((lat + dlat, lng + dlng))
     path = "color:0x0d9488ff|weight:2|fillcolor:0x0d948833|" + "|".join([str(round(p[0], 5)) + "," + str(round(p[1], 5)) for p in pts])
 
     markers = []
-    # Place center pin (teal)
     markers.append("color:0x0d9488|label:H|" + str(lat) + "," + str(lng))
-    # Event pins, color by severity
     sev_color = {"extreme": "0xdc2626", "severe": "0xea580c", "moderate": "0xd97706", "minor": "0xa16207"}
     for (elat, elng, sev) in ev_pins[:20]:
         c = sev_color.get(sev or "minor", "0xa16207")
         markers.append("color:" + c + "|" + str(round(elat, 5)) + "," + str(round(elng, 5)))
 
+    # Zoom math: a 640px-wide map at zoom z covers ~ 156543.03 / 2^z meters per pixel
+    # at the equator, scaled by cos(lat). We want the radius diameter (2*radius) to fit
+    # ~85% of the 640px width, so:
+    #   2 * radius_meters = 0.85 * 640 * (156543.03 / 2^z) * cos(lat)
+    # solve for z. Clamp to [3, 14] so we never zoom past country-level or street-level.
+    radius_m = radius_mi * 1609.344
+    cos_lat = max(0.01, math.cos(math.radians(lat)))
+    target_m_per_pixel = (2 * radius_m) / (0.85 * 640)
+    if target_m_per_pixel <= 0:
+        zoom = 9
+    else:
+        zoom_float = math.log2((156543.03 * cos_lat) / target_m_per_pixel)
+        zoom = max(3, min(14, int(round(zoom_float))))
+
     params = [
         "size=640x320",
         "scale=2",
         "maptype=terrain",
+        "zoom=" + str(zoom),
+        "center=" + str(lat) + "," + str(lng),
         "path=" + urllib.parse.quote(path),
     ]
     for m in markers:
