@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi import FastAPI, Depends, HTTPException, Header, status
 from fastapi.security import OAuth2PasswordBearer
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
@@ -33,7 +33,7 @@ RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 FROM_EMAIL = os.environ.get("FROM_EMAIL", "alerts@earthwatch.app")
 GOOGLE_GEOCODING_API_KEY = os.environ.get("GOOGLE_GEOCODING_API_KEY", "")
 
-VERSION = "0.1.6"
+VERSION = "0.1.7"
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
@@ -1134,6 +1134,35 @@ def run_scheduler():
                 print("[scheduler] check cycle failed: " + str(e))
             last_run = now
         time.sleep(60)
+
+
+@app.get("/admin/signup-stats")
+async def admin_signup_stats(x_admin_token: str = Header(None, alias="X-Admin-Token")):
+    """Read-only signup metrics for the 3Brains scoreboard.
+    Requires X-Admin-Token header matching ADMIN_STATS_TOKEN env var."""
+    expected = os.environ.get("ADMIN_STATS_TOKEN")
+    if not expected or x_admin_token != expected:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM users")
+        total_users = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM users WHERE created_at >= NOW() - INTERVAL '24 hours'")
+        signups_24h = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM users WHERE created_at >= NOW() - INTERVAL '7 days'")
+        signups_7d = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM users WHERE created_at >= NOW() - INTERVAL '30 days'")
+        signups_30d = c.fetchone()[0]
+        c.execute("SELECT MAX(created_at) FROM users")
+        latest_row = c.fetchone()
+        latest = latest_row[0].isoformat() if latest_row and latest_row[0] else None
+        return {
+            "total_users": total_users,
+            "signups_24h": signups_24h,
+            "signups_7d": signups_7d,
+            "signups_30d": signups_30d,
+            "latest_signup_at": latest
+        }
 
 
 @app.on_event("startup")
