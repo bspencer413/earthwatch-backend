@@ -33,7 +33,7 @@ RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 FROM_EMAIL = os.environ.get("FROM_EMAIL", "alerts@earthwatch.app")
 GOOGLE_GEOCODING_API_KEY = os.environ.get("GOOGLE_GEOCODING_API_KEY", "")
 
-VERSION = "0.1.7"
+VERSION = "0.1.8"
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
@@ -596,7 +596,7 @@ async def get_place_events(place_id: int, user_id: int = Depends(get_current_use
             SELECT e.id, e.source, e.external_id, e.hazard_type, e.severity, e.magnitude,
                    e.title, e.description, e.url, e.occurred_at,
                    ST_Distance(e.geom, p.geom) / 1609.344 AS distance_mi,
-                   ST_Y(e.geom::geometry) AS ev_lat, ST_X(e.geom::geometry) AS ev_lng
+                   ST_Y(ST_Centroid(e.geom)::geometry) AS ev_lat, ST_X(ST_Centroid(e.geom)::geometry) AS ev_lng
             FROM ew_events e, ew_places p
             WHERE p.id = %s
               AND ST_DWithin(e.geom, p.geom, p.radius_mi * 1609.344)
