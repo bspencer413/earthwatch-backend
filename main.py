@@ -33,7 +33,7 @@ RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 FROM_EMAIL = os.environ.get("FROM_EMAIL", "alerts@earthwatch.app")
 GOOGLE_GEOCODING_API_KEY = os.environ.get("GOOGLE_GEOCODING_API_KEY", "")
 
-VERSION = "0.1.10"
+VERSION = "0.1.11"
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
@@ -654,7 +654,9 @@ async def get_place_events(place_id: int, user_id: int = Depends(get_current_use
                 "lng": ev_lng,
             })
             if ev_lat is not None and ev_lng is not None:
-                ev_pins.append((ev_lat, ev_lng, row[4]))
+                # (lat, lng, severity, hazard_type) -- hazard_type drives the icon
+                # on the static map; severity is the color fallback if no icon match.
+                ev_pins.append((ev_lat, ev_lng, row[4], row[3]))
 
         static_map_url = build_static_map_url(place_lat, place_lng, place_radius, ev_pins)
 
@@ -694,10 +696,35 @@ def build_static_map_url(lat: float, lng: float, radius_mi: float, ev_pins: list
 
     markers = []
     markers.append("color:0x0d9488|label:H|" + str(lat) + "," + str(lng))
+    # Per-hazard Twemoji PNG icons (same emoji rendered in the drawer cards).
+    # Pinned to twemoji v14.0.2 on jsdelivr for stability. If Google can't fetch
+    # the icon URL, that marker drops silently -- map + Home pin still render.
+    hazard_cp = {
+        "volcano":          "1f30b",   # 🌋
+        "wildfire":         "1f525",   # 🔥
+        "earthquake":       "1f310",   # 🌐
+        "hurricane":        "1f300",   # 🌀
+        "tropical_cyclone": "1f300",   # 🌀
+        "tornado":          "1f32a",   # 🌪
+        "tsunami":          "1f30a",   # 🌊
+        "flood":            "1f30a",   # 🌊
+        "severe_weather":   "26c8",    # ⛈
+        "winter_storm":     "2744",    # ❄
+    }
+    icon_base = "https://cdn.jsdelivr.net/gh/twitter/twemoji@14.0.2/assets/72x72/"
     sev_color = {"extreme": "0xdc2626", "severe": "0xea580c", "moderate": "0xd97706", "minor": "0xa16207"}
-    for (elat, elng, sev) in ev_pins[:20]:
-        c = sev_color.get(sev or "minor", "0xa16207")
-        markers.append("color:" + c + "|" + str(round(elat, 5)) + "," + str(round(elng, 5)))
+    for pin in ev_pins[:20]:
+        # Accept both (lat, lng, sev) legacy and (lat, lng, sev, hazard_type) v0.1.11+.
+        elat, elng = pin[0], pin[1]
+        sev = pin[2] if len(pin) >= 3 else "minor"
+        hazard_type = pin[3] if len(pin) >= 4 else None
+        cp = hazard_cp.get(hazard_type or "")
+        if cp:
+            markers.append("icon:" + icon_base + cp + ".png|" + str(round(elat, 5)) + "," + str(round(elng, 5)))
+        else:
+            # No hazard icon mapping -- fall back to a severity-colored dot.
+            c = sev_color.get(sev or "minor", "0xa16207")
+            markers.append("color:" + c + "|" + str(round(elat, 5)) + "," + str(round(elng, 5)))
 
     # Zoom math: a 640px-wide map at zoom z covers ~ 156543.03 / 2^z meters per pixel
     # at the equator, scaled by cos(lat). We want the radius diameter (2*radius) to fit
@@ -825,6 +852,32 @@ async def delete_notification(notif_id: int, user_id: int = Depends(get_current_
 #   {source, external_id, hazard_type, severity, magnitude, title, description,
 #    url, occurred_at, geom_wkt, raw}
 # The cron upserts these into ew_events keyed on (source, external_id).
+
+# Module-level cache for US volcano coordinates. The HANS getElevatedVolcanoes
+# feed identifies volcanoes by vnum but doesn't carry lat/lng; we fetch the full
+# US volcano list once per process from volcanoesUS and cache the lookup.
+# ~161 entries, rarely changes; one HTTP call at first HVO cron tick.
+_VOLCANO_COORDS: dict = {}
+
+def _ensure_volcano_coords():
+    """Lazy-populate _VOLCANO_COORDS on first HVO call. Idempotent.
+    Failure is non-fatal -- fetch_hvo() simply skips volcanoes it can't place."""
+    global _VOLCANO_COORDS
+    if _VOLCANO_COORDS:
+        return
+    try:
+        data = Sources._http_get_json("https://volcanoes.usgs.gov/vsc/api/volcanoApi/volcanoesUS")
+        if isinstance(data, list):
+            for v in data:
+                vnum = str(v.get("vnum") or "")
+                lat = v.get("latitude")
+                lng = v.get("longitude")
+                if vnum and lat is not None and lng is not None:
+                    _VOLCANO_COORDS[vnum] = (float(lat), float(lng), v.get("vName"))
+            print("[hvo] cached " + str(len(_VOLCANO_COORDS)) + " US volcano coordinates")
+    except Exception as e:
+        print("[hvo] volcanoesUS cache load failed: " + str(e))
+
 
 class Sources:
     """All hazard feed adapters. Each fetch_* returns a list of normalized event dicts."""
@@ -997,12 +1050,10 @@ class Sources:
             })
         return out
 
-    # ── NASA EONET v3 (volcanoes + wildfires) ─────────────────────────────────
-    # Free, no auth, no key. Single endpoint covers volcanoes worldwide
-    # (curated from USGS HVO, AVO, Smithsonian GVP) and wildfires >=500 acres
-    # (IRWIN for US, GDACS for intl). Severe storms intentionally skipped --
-    # NWS already covers US storms and we don't want duplicate alerts. Sea/lake
-    # ice skipped -- no frontend icon mapping yet.
+    # ── NASA EONET v3 (wildfires only) ────────────────────────────────────────
+    # Free, no auth, no key. v0.1.11: volcanoes moved to fetch_hvo() for real-time
+    # HANS data; EONET retained for wildfires >=500 acres (IRWIN US, GDACS intl).
+    # Severe storms still skipped -- NWS covers US; sea/lake ice -- no icon.
     @staticmethod
     def fetch_eonet() -> List[dict]:
         url = "https://eonet.gsfc.nasa.gov/api/v3/events?status=open"
@@ -1011,7 +1062,6 @@ class Sources:
             return []
         # EONET v3 uses string slug ids on the category objects, not integers.
         cat_map = {
-            "volcanoes": "volcano",
             "wildfires": "wildfire",
         }
         out = []
@@ -1095,6 +1145,70 @@ class Sources:
             })
         return out
 
+    # ── USGS HVO / HANS (real-time elevated US volcanoes) ─────────────────────
+    # Hazard Notification System feed of every US volcano currently at
+    # ADVISORY/WATCH/WARNING. Real-time, no curator lag, no auth, no key.
+    # Covers HVO (Hawaii), AVO (Alaska), CVO (Cascades), CalVO (California),
+    # YVO (Yellowstone), NMI (N. Mariana Islands). v0.1.11: replaces EONET as
+    # the volcano source -- EONET timestamps can lag actual activity by weeks.
+    #
+    # Lat/lng is not in the elevated feed; we cache it once from volcanoesUS
+    # (module-level _VOLCANO_COORDS, lazy-loaded on first call).
+    @staticmethod
+    def fetch_hvo() -> List[dict]:
+        _ensure_volcano_coords()
+        url = "https://volcanoes.usgs.gov/hans-public/api/volcano/getElevatedVolcanoes"
+        data = Sources._http_get_json(url)
+        if not isinstance(data, list):
+            return []
+        sev_map = {
+            "WARNING":  "extreme",
+            "WATCH":    "severe",
+            "ADVISORY": "moderate",
+        }
+        out = []
+        for v in data:
+            vnum = str(v.get("vnum") or "")
+            if not vnum:
+                continue
+            coords = _VOLCANO_COORDS.get(vnum)
+            if not coords:
+                # No lat/lng on file -- skip rather than emit an unplaceable event.
+                continue
+            lat, lng, _name = coords
+            alert_level = (v.get("alert_level") or "").upper()
+            color_code = (v.get("color_code") or "").upper()
+            severity = sev_map.get(alert_level, "moderate")
+            volcano_name = v.get("volcano_name") or "Volcano"
+            obs_fullname = v.get("obs_fullname") or "USGS"
+            title = volcano_name + " - " + (alert_level or "ELEVATED")
+            desc = obs_fullname
+            if color_code:
+                desc = desc + " | Aviation: " + color_code
+            occurred_at = None
+            ts = v.get("sent_utc")
+            if ts:
+                try:
+                    # Format: "2026-05-15 18:55:00" (naive UTC).
+                    occurred_at = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
+                except Exception:
+                    occurred_at = None
+            geom_wkt = "POINT(" + str(lng) + " " + str(lat) + ")"
+            out.append({
+                "source": "hvo",
+                "external_id": vnum,    # one row per volcano, updated in place
+                "hazard_type": "volcano",
+                "severity": severity,
+                "magnitude": None,
+                "title": title,
+                "description": desc,
+                "url": v.get("notice_url"),
+                "occurred_at": occurred_at,
+                "geom_wkt": geom_wkt,
+                "raw": {"vnum": vnum, "alert_level": alert_level, "color_code": color_code},
+            })
+        return out
+
     # ── GDACS (global multi-hazard aggregator) ────────────────────────────────
     # Stub for v0.1.0. Used as international fill-in for places outside US.
     @staticmethod
@@ -1105,7 +1219,7 @@ class Sources:
 
     @staticmethod
     def all_sources() -> List[str]:
-        return ["usgs", "nws", "eonet", "gdacs"]
+        return ["usgs", "nws", "eonet", "hvo", "gdacs"]
 
     @staticmethod
     def fetch(source: str) -> List[dict]:
@@ -1115,6 +1229,8 @@ class Sources:
             return Sources.fetch_nws()
         if source == "eonet":
             return Sources.fetch_eonet()
+        if source == "hvo":
+            return Sources.fetch_hvo()
         if source == "gdacs":
             return Sources.fetch_gdacs()
         return []
@@ -1289,7 +1405,7 @@ async def startup_event():
     print("Database initialized (EarthWatch v" + VERSION + ")")
     scheduler_thread = threading.Thread(target=run_scheduler, daemon=True)
     scheduler_thread.start()
-    print("Background scheduler started (12-hour check cycle: usgs + nws + eonet + gdacs)")
+    print("Background scheduler started (12-hour check cycle: usgs + nws + eonet + hvo + gdacs)")
     threading.Thread(target=run_check_cycle, daemon=True).start()
     print("Initial EW check cycle started")
 
