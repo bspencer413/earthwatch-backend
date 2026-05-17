@@ -33,7 +33,7 @@ RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 FROM_EMAIL = os.environ.get("FROM_EMAIL", "alerts@earthwatch.app")
 GOOGLE_GEOCODING_API_KEY = os.environ.get("GOOGLE_GEOCODING_API_KEY", "")
 
-VERSION = "0.1.9"
+VERSION = "0.1.10"
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
@@ -592,6 +592,13 @@ async def get_place_events(place_id: int, user_id: int = Depends(get_current_use
 
         # Live spatial join: fetch matched events directly from ew_events for this
         # place, regardless of is_archived state. No dependence on ew_event_matches.
+        #
+        # v0.1.10: priority sort. Pure occurred_at DESC was wrong — a swarm of M2.0
+        # quakes would push an active volcano off the LIMIT 50 cutoff. We now sort
+        # by (1) severity bucket, then (2) hazard-type priority, then (3) recency.
+        # EONET events are exempt from the 30-day occurred_at filter: EONET curates
+        # its own open/closed status (volcanoes auto-close after 6-7 weeks of
+        # inactivity), and the geometry timestamp can lag the real activity.
         c.execute("""
             SELECT e.id, e.source, e.external_id, e.hazard_type, e.severity, e.magnitude,
                    e.title, e.description, e.url, e.occurred_at,
@@ -600,8 +607,29 @@ async def get_place_events(place_id: int, user_id: int = Depends(get_current_use
             FROM ew_events e, ew_places p
             WHERE p.id = %s
               AND ST_DWithin(e.geom, p.geom, p.radius_mi * 1609.344)
-              AND e.occurred_at > NOW() - INTERVAL '30 days'
-            ORDER BY e.occurred_at DESC
+              AND (e.source = 'eonet' OR e.occurred_at > NOW() - INTERVAL '30 days')
+            ORDER BY
+              CASE e.severity
+                WHEN 'extreme'  THEN 0
+                WHEN 'severe'   THEN 1
+                WHEN 'moderate' THEN 2
+                WHEN 'minor'    THEN 3
+                ELSE 4
+              END,
+              CASE e.hazard_type
+                WHEN 'volcano'          THEN 0
+                WHEN 'tsunami'          THEN 1
+                WHEN 'hurricane'        THEN 2
+                WHEN 'tropical_cyclone' THEN 2
+                WHEN 'tornado'          THEN 3
+                WHEN 'wildfire'         THEN 4
+                WHEN 'severe_weather'   THEN 5
+                WHEN 'flood'            THEN 6
+                WHEN 'winter_storm'     THEN 7
+                WHEN 'earthquake'       THEN 8
+                ELSE 9
+              END,
+              e.occurred_at DESC
             LIMIT 50
         """, (place_id,))
 
