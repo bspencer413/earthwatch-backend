@@ -1379,6 +1379,38 @@ async def admin_signup_stats(x_admin_token: str = Header(None, alias="X-Admin-To
         }
 
 
+@app.get("/admin/platform-stats")
+async def admin_platform_stats():
+    """Aggregate signup metrics for the scoreboard. Public, no auth — counts only."""
+    targets = [("users", "ew_users")]
+    result = {}
+    with get_db() as conn:
+        c = conn.cursor()
+        for table, key in targets:
+            try:
+                c.execute("""
+                    SELECT
+                        COUNT(*),
+                        COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '24 hours'),
+                        COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '7 days'),
+                        COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '30 days'),
+                        MAX(created_at)
+                    FROM {}
+                """.format(table))
+                row = c.fetchone()
+                result[key] = {
+                    "total_users": row[0],
+                    "signups_24h": row[1],
+                    "signups_7d": row[2],
+                    "signups_30d": row[3],
+                    "latest_signup_at": row[4].isoformat() if row[4] else None
+                }
+            except Exception as e:
+                conn.rollback()
+                result[key] = {"error": str(e)}
+        return result
+
+
 @app.on_event("startup")
 async def startup_event():
     init_db()
