@@ -794,9 +794,11 @@ async def get_notifications(user_id: int = Depends(get_current_user)):
         c = conn.cursor()
         c.execute("""
             SELECT n.id, n.message, n.created_at, n.watchlist_id, n.source_type, n.source_ref_id,
-                   p.name AS place_name
+                   p.name AS place_name, ev.occurred_at
             FROM notifications n
             LEFT JOIN ew_places p ON n.watchlist_id = p.id
+            LEFT JOIN ew_event_matches m ON n.source_ref_id = m.id
+            LEFT JOIN ew_events ev ON m.event_id = ev.id
             WHERE n.user_id = %s
             ORDER BY n.created_at DESC LIMIT 100
         """, (user_id,))
@@ -810,6 +812,7 @@ async def get_notifications(user_id: int = Depends(get_current_user)):
                 "source_type": row[4] or "",
                 "source_ref_id": row[5],
                 "name": row[6] or "",
+                "occurred_at": str(row[7]) if row[7] else None,
             })
         return notifications
 
