@@ -380,8 +380,13 @@ async def get_stats():
 
 
 @app.get("/admin/check-now")
-async def admin_check_now():
-    """Manually trigger a full source pull + spatial-join + alert pass."""
+async def admin_check_now(key: str = ""):
+    """Manually trigger a full source pull + spatial-join + alert pass.
+    Guarded by CRON_KEY so a public scheduler (cron-job.org) can call it on a
+    schedule but random visitors can't. If CRON_KEY is unset, stays open."""
+    cron_key = os.environ.get("CRON_KEY", "")
+    if cron_key and key != cron_key:
+        raise HTTPException(status_code=403, detail="Forbidden")
     threading.Thread(target=run_check_cycle, daemon=True).start()
     return {"message": "EW check cycle started"}
 
@@ -794,11 +799,9 @@ async def get_notifications(user_id: int = Depends(get_current_user)):
         c = conn.cursor()
         c.execute("""
             SELECT n.id, n.message, n.created_at, n.watchlist_id, n.source_type, n.source_ref_id,
-                   p.name AS place_name, ev.occurred_at
+                   p.name AS place_name
             FROM notifications n
             LEFT JOIN ew_places p ON n.watchlist_id = p.id
-            LEFT JOIN ew_event_matches m ON n.source_ref_id = m.id
-            LEFT JOIN ew_events ev ON m.event_id = ev.id
             WHERE n.user_id = %s
             ORDER BY n.created_at DESC LIMIT 100
         """, (user_id,))
@@ -812,7 +815,6 @@ async def get_notifications(user_id: int = Depends(get_current_user)):
                 "source_type": row[4] or "",
                 "source_ref_id": row[5],
                 "name": row[6] or "",
-                "occurred_at": str(row[7]) if row[7] else None,
             })
         return notifications
 
